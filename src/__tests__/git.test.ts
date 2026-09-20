@@ -8,6 +8,7 @@ import {
   getCurrentCommit,
   getDefaultBranch,
   getLastVersionTag,
+  getRemoteBranchCommit,
   parseCommits,
   pathspecSuffix,
   preflightChecks,
@@ -212,6 +213,27 @@ describe('against a real repository', () => {
       assert.strictEqual(rollbackLocalRelease(startCommit, 'v1.1.0'), true);
       assert.strictEqual(getCurrentCommit(), startCommit);
       assert.throws(() => repo.git('rev-parse', 'v1.1.0'));
+      assert.strictEqual(getRemoteBranchCommit('main'), startCommit);
+    });
+
+    it('still resets but reports failure when the tag cannot be deleted', () => {
+      tmpfs.mock({});
+      const repo = initRepo();
+      const startCommit = getCurrentCommit();
+      repo.commit({ 'a.txt': 'a' }, 'Local only');
+
+      assert.strictEqual(rollbackLocalRelease(startCommit, 'v9.9.9'), false);
+      assert.strictEqual(getCurrentCommit(), startCommit);
+    });
+
+    it('reads the branch head from origin, not from the local ref', () => {
+      tmpfs.mock({});
+      const repo = initRepo();
+      const published = getCurrentCommit();
+      repo.commit({ 'a.txt': 'a' }, 'Local only');
+
+      assert.strictEqual(getRemoteBranchCommit('main'), published);
+      assert.strictEqual(getRemoteBranchCommit('no-such-branch'), null);
     });
 
     it('rolls back commits even with no tag to delete', () => {

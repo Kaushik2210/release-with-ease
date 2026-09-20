@@ -41,6 +41,7 @@ import {
   getCommitRange,
   getCurrentCommit,
   getLastVersionTag,
+  getRemoteBranchCommit,
   parseCommits,
   preflightChecks,
   rollbackLocalRelease,
@@ -195,7 +196,7 @@ export async function main(argv: ReadonlyArray<string>): Promise<void> {
     }
     console.log(`  ${step++}. npm version ${finalBump} --no-git-tag-version`);
     console.log(`  ${step++}. git add package.json (and any lockfile) + commit + tag v${newVersion}`);
-    console.log(`  ${step++}. git push origin ${defaultBranch} --tags`);
+    console.log(`  ${step++}. git push --atomic origin ${defaultBranch} --tags`);
     console.log(
       `  ${step++}. gh release create v${newVersion} --title "v${newVersion}" --notes-file <entry>`,
     );
@@ -223,6 +224,7 @@ export async function main(argv: ReadonlyArray<string>): Promise<void> {
   // commit can only ever undo commits/tags this run made itself.
   const startCommit = getCurrentCommit();
   let tagName: string | null = null;
+  let pushAttempted = false;
 
   try {
     if (useReadmeChangelog) {
@@ -249,26 +251,48 @@ export async function main(argv: ReadonlyArray<string>): Promise<void> {
       if (fs.existsSync(lockFile)) run(`git add ${lockFile}`);
     }
     run(`git commit -m "${newVersion}"`);
+    // Only remembered once it exists, so a failed `git tag` (say, because
+    // the tag was already there) can't get an older tag deleted on rollback.
+    run(`git tag -m "${newVersion}" "v${newVersion}"`);
     tagName = `v${newVersion}`;
-    run(`git tag -m "${newVersion}" "${tagName}"`);
 
-    // Push commit and tags explicitly
+    // Push commit and tags explicitly. --atomic makes it all-or-nothing, so
+    // the branch can't move while a tag is rejected.
+    pushAttempted = true;
     run(`git push --atomic origin ${defaultBranch} --tags`);
   } catch (err) {
-    console.error(
-      `\n❌ Release failed before anything was pushed: ${(err as Error).message || err}`,
-    );
-    if (rollbackLocalRelease(startCommit, tagName)) {
-      console.error(
-        `🔄 Rolled back local changes. "${defaultBranch}" is back at ${startCommit.slice(
-          0,
-          7,
-        )}; origin was never touched.`,
-      );
+    console.error(`\n❌ Release failed: ${(err as Error).message || err}`);
+
+    // A failed push isn't proof that origin is untouched: the server can
+    // accept the update and the connection drop before we hear about it.
+    // Only roll back once origin is confirmed to still be where we started.
+    const remoteCommit = pushAttempted ? getRemoteBranchCommit(defaultBranch) : startCommit;
+    if (remoteCommit === startCommit) {
+      if (rollbackLocalRelease(startCommit, tagName)) {
+        console.error(
+          `🔄 Rolled back local changes. "${defaultBranch}" is back at ${startCommit.slice(
+            0,
+            7,
+          )}; origin was not changed.`,
+        );
+      } else {
+        console.error(
+          '⚠️  Automatic rollback failed too. The release commit(s)/tag may still be present ' +
+            'locally — check `git log` and `git tag`, and clean up manually before retrying.',
+        );
+      }
     } else {
       console.error(
-        '⚠️  Automatic rollback failed too. The release commit(s)/tag may still be present ' +
-          'locally — check `git log` and `git tag`, and clean up manually before retrying.',
+        remoteCommit
+          ? `⚠️  The push failed, but origin/${defaultBranch} is now at ${remoteCommit.slice(0, 7)}, ` +
+              `not ${startCommit.slice(0, 7)}. The release may have gone through.`
+          : `⚠️  The push failed and origin could not be reached to check whether it went through.`,
+      );
+      console.error(
+        '   Local changes were left as they are. Run `git ls-remote origin` to see what origin ' +
+          `has: if it has v${newVersion}, finish by hand (gh release create, npm publish); ` +
+          'if not, run `git push --atomic origin ' +
+          `${defaultBranch} --tags\` again.`,
       );
     }
     throw err;
@@ -288,7 +312,6 @@ export async function main(argv: ReadonlyArray<string>): Promise<void> {
       `gh release create v${newVersion} --title "v${newVersion}" --notes-file "${ghNotesFile}"`,
     ).trim();
     console.log(`\n🎉 GitHub release created: ${releaseUrl}`);
-    fs.unlinkSync(ghNotesFile);
   } catch (err) {
     console.error(
       `\n⚠️  v${newVersion} was committed, tagged, and pushed to ${defaultBranch}, but creating ` +
@@ -297,6 +320,12 @@ export async function main(argv: ReadonlyArray<string>): Promise<void> {
         `     gh release create v${newVersion} --title "v${newVersion}" --notes-file "${ghNotesFile}"`,
     );
     throw err;
+  }
+  // The release exists by now, so a temp file that won't delete is only litter.
+  try {
+    fs.unlinkSync(ghNotesFile);
+  } catch {
+    console.warn(`⚠️  Could not delete ${ghNotesFile}; you can remove it yourself.`);
   }
 
   if (isPublicPackage) {
@@ -329,9 +358,11 @@ export async function main(argv: ReadonlyArray<string>): Promise<void> {
     const publishCmd = otp ? `npm publish --otp=${otp}` : 'npm publish';
     const publishResult = safeRun(publishCmd, { stdio: 'inherit' });
     if (!publishResult.ok) {
+      // The OTP is a live credential and this lands in terminal scrollback
+      // and CI logs, so the retry hint never spells it out.
       console.error(
         `\n⚠️  v${newVersion} was released on GitHub, but \`npm publish\` failed.\n` +
-          `   Retry manually with: ${publishCmd}`,
+          `   Retry manually with: npm publish${otp ? ' --otp=<a fresh code>' : ''}`,
       );
       throw publishResult.err;
     }
