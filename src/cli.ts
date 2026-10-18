@@ -5,7 +5,8 @@
   - Prompts for confirmation or choice override
   - Generates concise release notes using Claude
   - Inserts a new entry at the top of the Changelog in README.md
-  - Commits changelog update, bumps version via npm, and pushes with tags
+  - Commits changelog update, bumps the version in package.json, tags, and
+    pushes the commit and the tag
 
   Requirements:
     - ANTHROPIC_API_KEY environment variable must be set
@@ -14,6 +15,7 @@
     npx release-with-ease            # Normal release
     npx release-with-ease --dry-run  # Preview what would be done
     npx release-with-ease --path .   # Only analyze commits touching a path
+    npx release-with-ease my-package # Release a package in this repository by name
 */
 
 import crypto from 'node:crypto';
@@ -23,33 +25,48 @@ import path from 'node:path';
 
 import {
   configuredPaths,
-  parseArgs,
-  UsageError,
-  unscopedSubdirectoryWarning,
+  configuredTagPrefix,
+  configuredWaitFor,
   type PackageJson,
+  parseArgs,
+  unscopedSubdirectoryWarning,
+  UsageError,
 } from './args.ts';
-import { askClaudeForRelease } from './claude.ts';
 import {
   hasReadmeChangelog,
   insertChangelogEntry,
   packageJsonPath,
   readmePath,
 } from './changelog.ts';
+import { askClaudeForRelease, type OmittedChange } from './claude.ts';
 import { run, safeRun } from './exec.ts';
 import {
+  commitAndTagRelease,
   fetchOriginTags,
   getCommitRange,
   getCurrentCommit,
-  getLastVersionTag,
+  getLastReleaseTag,
   getRemoteBranchCommit,
   parseCommits,
   preflightChecks,
+  pushRelease,
   rollbackLocalRelease,
+  shellQuote,
+  tagExists,
 } from './git.ts';
-import { fetchGitHubMeta, type CommitWithMeta } from './github.ts';
+import { type CommitWithMeta, fetchGitHubMeta } from './github.ts';
 import { fetchNpmOtp } from './npm.ts';
+import { writeVersion } from './packageJson.ts';
 import { prompt } from './prompt.ts';
-import { bumpVersionString, isBump, type Bump } from './version.ts';
+import { DEFAULT_TAG_PREFIX, releaseName } from './tags.ts';
+import {
+  type Bump,
+  bumpVersionString,
+  compareVersions,
+  isBump,
+} from './version.ts';
+import { checkWaitFor, waitForMessage } from './waitFor.ts';
+import { resolvePackageDir } from './workspace.ts';
 
 /**
  * One line per entry, as it will be handed to Claude. Squash-merge subjects
@@ -57,7 +74,7 @@ import { bumpVersionString, isBump, type Bump } from './version.ts';
  * something.
  */
 export function formatCommitLine(commit: CommitWithMeta): string {
-  const shortSha = commit.hash.substring(0, 7);
+  const shortSha = commit.hash.slice(0, 7);
   const pr =
     commit.prNumber && !commit.subject.includes(`#${commit.prNumber}`)
       ? ` (#${commit.prNumber})`
@@ -65,14 +82,73 @@ export function formatCommitLine(commit: CommitWithMeta): string {
   return `  ${shortSha} ${commit.subject}${pr}`;
 }
 
+/**
+ * Starts a line of editor-only context, the way `#` does in a git commit
+ * message. `#` itself would take the entry's `## x.y.z` heading with it.
+ */
+const EDITOR_COMMENT_PREFIX = '//';
+
+function editorComment(text: string): string {
+  return `${EDITOR_COMMENT_PREFIX} ${text}`;
+}
+
+/**
+ * What the editor opens with: the entry to publish, then the changes no
+ * bullet point covers, so a change left out is a line to read rather than
+ * something to notice missing. Each line of that context is a comment of its
+ * own and is dropped on its own, so deleting or moving some of them can't
+ * leave the rest behind in the release notes, and turning one into a bullet
+ * point is a matter of editing that line.
+ */
+export function buildEditorContent(
+  entry: string,
+  omitted: ReadonlyArray<OmittedChange>,
+): string {
+  const context = omitted.length
+    ? [
+        'Not covered by any bullet point above; add any that users should hear about:',
+        ...omitted.map(
+          ({ commit, reason }) =>
+            `${formatCommitLine(commit)}: ${reason ?? '(no reason given)'}`,
+        ),
+      ]
+    : ['Every change in this release is covered by a bullet point above.'];
+  return [
+    entry.trimEnd(),
+    '',
+    editorComment(
+      `Lines starting with ${EDITOR_COMMENT_PREFIX} are discarded when the editor closes.`,
+    ),
+    ...context.map(editorComment),
+    '',
+  ].join('\n');
+}
+
+/**
+ * The entry as edited, without the editor-only context: every line that starts
+ * with the comment prefix. Only at the very start of a line, so an indented
+ * `//` in a code sample stays.
+ */
+export function stripEditorComments(content: string): string {
+  return content
+    .split('\n')
+    .filter((line) => !line.startsWith(EDITOR_COMMENT_PREFIX))
+    .join('\n')
+    .trim();
+}
+
 export async function main(argv: ReadonlyArray<string>): Promise<void> {
-  const { dryRun, paths: pathArgs } = parseArgs(argv);
+  const { dryRun, paths: pathArgs, packageName } = parseArgs(argv);
 
   // Check for required environment variable early
   if (!process.env['ANTHROPIC_API_KEY']) {
     console.error('❌ ANTHROPIC_API_KEY environment variable is required.');
-    console.error('   You can get one from https://console.anthropic.com/settings/keys');
-    console.error('   Please add it to your .env file: ANTHROPIC_API_KEY=your_key_here');
+    console.error(
+      '   You can get one from https://console.anthropic.com/settings/keys',
+    );
+    console.error(
+      '   Please add it to your .env file: ANTHROPIC_API_KEY=your_key_here',
+    );
     process.exit(1);
   }
 
@@ -80,20 +156,70 @@ export async function main(argv: ReadonlyArray<string>): Promise<void> {
     console.log('🔍 DRY RUN MODE - No changes will be made\n');
   }
 
-  const pkg = JSON.parse(fs.readFileSync(packageJsonPath(), 'utf8')) as PackageJson;
+  // Everything after this point works on the current directory — package.json,
+  // README.md, pathspecs — so releasing a named package is a matter of
+  // starting out in its directory.
+  if (packageName !== null) {
+    const dir = resolvePackageDir(packageName);
+    if (dir !== process.cwd()) {
+      console.log(
+        `📦 Releasing from ${path.relative(process.cwd(), dir) || '.'}\n`,
+      );
+      process.chdir(dir);
+    }
+  }
+
+  const pkg = JSON.parse(
+    fs.readFileSync(packageJsonPath(), 'utf8'),
+  ) as PackageJson;
   const isPublicPackage = pkg.private !== true && pkg.private !== 'true';
   const privateFieldMissing = isPublicPackage && pkg.private === undefined;
   const paths = pathArgs.length ? pathArgs : configuredPaths(pkg);
+  // Validated here, before the fetch below, so that a bad tagPrefix or
+  // waitFor in package.json fails without touching the remote.
+  const tagPrefix = configuredTagPrefix(pkg);
+  // eslint-disable-next-line unicorn/no-declarations-before-early-exit
+  const waitFor = configuredWaitFor(pkg);
 
-  fetchOriginTags();
+  // The check below for a tag that already exists, and finding the last
+  // release at all, only see the tags that are here locally.
+  if (fetchOriginTags() === null) {
+    throw new Error(
+      'Could not fetch tags from origin. Check your connection and access to the remote, then try again.',
+    );
+  }
   const { defaultBranch } = preflightChecks();
-  const lastVersionTag = getLastVersionTag();
+  const { tag: lastVersionTag, fromDefaultPrefix } = getLastReleaseTag(
+    tagPrefix,
+    pkg.version,
+  );
+  if (fromDefaultPrefix) {
+    console.log(
+      `ℹ️  No ${tagPrefix} tags yet; starting from ${lastVersionTag}, the tag for the version in package.json.`,
+    );
+  }
+  // A release can be tagged without package.json hearing about it: a deploy
+  // tool that releases docs at the commit it just deployed can't add a commit
+  // there. Bumping package.json's version would then land on a version that
+  // was already released, or behind it, so the newer of the two is the base.
+  const lastTagVersion = lastVersionTag?.slice(
+    (fromDefaultPrefix ? DEFAULT_TAG_PREFIX : tagPrefix).length,
+  );
+  const tagIsAhead =
+    pkg.version !== undefined &&
+    lastTagVersion !== undefined &&
+    compareVersions(lastTagVersion, pkg.version) > 0;
+  if (tagIsAhead) {
+    console.log(
+      `ℹ️  ${lastVersionTag} is newer than the ${pkg.version} in package.json; the next version follows ${lastTagVersion}.`,
+    );
+  }
 
   const warning = unscopedSubdirectoryWarning(paths, pkg);
   if (warning) console.log(warning);
 
   const raw = getCommitRange(lastVersionTag, paths);
-  let commits: Array<CommitWithMeta> = parseCommits(raw).map(c => ({
+  let commits: Array<CommitWithMeta> = parseCommits(raw).map((c) => ({
     ...c,
     githubLogin: null,
     prNumber: null,
@@ -107,6 +233,25 @@ export async function main(argv: ReadonlyArray<string>): Promise<void> {
       }. Aborting.`,
     );
     process.exit(1);
+  }
+
+  // Before Claude is asked anything, so that a release that should wait costs
+  // nothing.
+  let waitingOn = 0;
+  for (const other of waitFor) {
+    const status = checkWaitFor(other);
+    const message = waitForMessage(other, status);
+    if (message) console.log(`\n${message}`);
+    if (status.kind === 'unreleased') waitingOn += 1;
+  }
+  if (waitingOn) {
+    const answer = (await prompt('\nRelease anyway? [y/N] '))
+      .trim()
+      .toLowerCase();
+    if (answer !== 'y' && answer !== 'yes') {
+      console.log('Aborted by user.');
+      process.exit(1);
+    }
   }
 
   // Resolve pull requests before printing the list: a stack merged as one
@@ -123,7 +268,7 @@ export async function main(argv: ReadonlyArray<string>): Promise<void> {
       paths.length ? ` (limited to ${paths.join(', ')})` : ''
     }:`,
   );
-  commits.forEach(commit => console.log(formatCommitLine(commit)));
+  for (const commit of commits) console.log(formatCommitLine(commit));
 
   console.log('\nWaiting for Claude to analyze commits...');
 
@@ -132,11 +277,13 @@ export async function main(argv: ReadonlyArray<string>): Promise<void> {
     throw new Error('Claude did not return a release suggestion.');
   }
 
-  const { bump, reasoning, notes } = result;
+  const { bump, reasoning, notes, omitted } = result;
 
   console.log(`\nSuggested version bump: ${bump}\n`);
   console.log(`Reasoning:\n\n${reasoning}\n`);
-  const confirm = (await prompt('Proceed with this bump? [Y/n/major/minor/patch] '))
+  const confirm = (
+    await prompt('Proceed with this bump? [Y/n/major/minor/patch] ')
+  )
     .trim()
     .toLowerCase();
   let finalBump: Bump = bump;
@@ -146,23 +293,35 @@ export async function main(argv: ReadonlyArray<string>): Promise<void> {
     process.exit(1);
   }
 
-  const curVersion = pkg.version;
+  const curVersion = tagIsAhead ? lastTagVersion : pkg.version;
   if (!curVersion) {
     throw new Error('package.json has no "version" field.');
   }
   const newVersion = bumpVersionString(curVersion, finalBump);
+  const release = releaseName(tagPrefix, newVersion);
+  // Found out now rather than after the changelog commit, when the only way
+  // out is to undo it by hand.
+  if (tagExists(release.tag)) {
+    throw new Error(
+      `The tag ${release.tag} already exists. Has ${newVersion} been released without package.json being updated?`,
+    );
+  }
 
   console.log(`\n📝 Release notes for ${newVersion}:`);
-  notes.forEach(note => console.log(`  ${note}`));
+  for (const note of notes) console.log(`  ${note}`);
 
   // Create a temporary file with just the changelog entry
   const randomName = `changelog-entry-${crypto.randomBytes(8).toString('hex')}.tmp`;
   const tempEntryPath = path.join(os.tmpdir(), randomName);
   const entryContent = [`## ${newVersion}`, '', ...notes, ''].join('\n');
-  fs.writeFileSync(tempEntryPath, entryContent);
+  fs.writeFileSync(tempEntryPath, buildEditorContent(entryContent, omitted));
 
-  console.log(`\n📝 Opening editor to review changelog entry for ${newVersion}...`);
-  console.log('   Edit the changelog entry as needed, then save and close the editor.');
+  console.log(
+    `\n📝 Opening editor to review changelog entry for ${newVersion}...`,
+  );
+  console.log(
+    '   Edit the changelog entry as needed, then save and close the editor.',
+  );
 
   // Open editor with the temporary entry file
   const editor = process.env['EDITOR'] || process.env['VISUAL'] || 'nano';
@@ -190,19 +349,31 @@ export async function main(argv: ReadonlyArray<string>): Promise<void> {
     console.log(`\n🔍 DRY RUN - Would have done the following:`);
     let step = 1;
     if (useReadmeChangelog) {
-      console.log(`  ${step++}. Insert changelog entry for ${newVersion} into README.md`);
+      console.log(
+        `  ${step++}. Insert changelog entry for ${newVersion} into README.md`,
+      );
       console.log(`  ${step++}. git add README.md`);
-      console.log(`  ${step++}. git commit -m "Update changelog for ${newVersion}"`);
+      console.log(
+        `  ${step++}. git commit -m "Update changelog for ${release.label}"`,
+      );
     }
-    console.log(`  ${step++}. npm version ${finalBump} --no-git-tag-version`);
-    console.log(`  ${step++}. git add package.json (and any lockfile) + commit + tag v${newVersion}`);
-    console.log(`  ${step++}. git push --atomic origin ${defaultBranch} --tags`);
     console.log(
-      `  ${step++}. gh release create v${newVersion} --title "v${newVersion}" --notes-file <entry>`,
+      `  ${step++}. Set "version": "${newVersion}" in package.json (and any npm lockfile)`,
+    );
+    console.log(
+      `  ${step++}. git commit -m "${release.label}" + tag ${release.tag}`,
+    );
+    console.log(
+      `  ${step++}. git push origin ${defaultBranch} refs/tags/${release.tag}`,
+    );
+    console.log(
+      `  ${step++}. gh release create ${release.tag} --title "${release.title}" --notes-file <entry>`,
     );
     if (isPublicPackage) {
-      console.log(`  ${step++}. npm whoami (run npm login if not authenticated)`);
-      console.log(`  ${step++}. npm publish`);
+      console.log(
+        `  ${step++}. npm whoami (run npm login if not authenticated)`,
+      );
+      console.log(`  ${step}. npm publish`);
       if (privateFieldMissing) {
         console.log(
           `\n⚠️  Warning: package.json has no "private" field. The package will be published to npm.\n` +
@@ -216,7 +387,9 @@ export async function main(argv: ReadonlyArray<string>): Promise<void> {
   }
 
   // Read the edited entry
-  const editedEntry = fs.readFileSync(tempEntryPath, 'utf8');
+  const editedEntry = stripEditorComments(
+    fs.readFileSync(tempEntryPath, 'utf8'),
+  );
 
   // Everything from here through the push is local and fully reversible, so
   // its starting point is worth remembering: preflightChecks already
@@ -230,43 +403,36 @@ export async function main(argv: ReadonlyArray<string>): Promise<void> {
     if (useReadmeChangelog) {
       // Insert changelog entry into README.md
       const readme = fs.readFileSync(readmePath(), 'utf8');
-      const updatedReadme = insertChangelogEntry(readme, editedEntry.trim().split('\n'));
+      const updatedReadme = insertChangelogEntry(
+        readme,
+        editedEntry.split('\n'),
+      );
       fs.writeFileSync(readmePath(), updatedReadme);
 
       run('git add README.md');
-      run(`git commit -m "Update changelog for ${newVersion}"`);
+      run(
+        `git commit -m ${shellQuote(`Update changelog for ${release.label}`)}`,
+      );
     }
 
     fs.unlinkSync(tempEntryPath);
 
-    // Bump the version with npm, but commit and tag it ourselves: `npm
-    // version`'s git detection (`@npmcli/git`'s `is()`) only checks for a
-    // literal ".git" entry inside its own cwd, so for a package released
-    // from a subdirectory of the repo (no ".git" there — it's at the repo
-    // root) it silently decides it isn't in a git repo and skips the commit
-    // and tag altogether, leaving the version bump as an uncommitted change.
-    run(`npm version ${finalBump} --no-git-tag-version`);
-    run('git add package.json');
-    for (const lockFile of ['package-lock.json', 'npm-shrinkwrap.json']) {
-      if (fs.existsSync(lockFile)) run(`git add ${lockFile}`);
-    }
-    run(`git commit -m "${newVersion}"`);
+    commitAndTagRelease(release, writeVersion(process.cwd(), newVersion));
     // Only remembered once it exists, so a failed `git tag` (say, because
     // the tag was already there) can't get an older tag deleted on rollback.
-    run(`git tag -m "${newVersion}" "v${newVersion}"`);
-    tagName = `v${newVersion}`;
+    tagName = release.tag;
 
-    // Push commit and tags explicitly. --atomic makes it all-or-nothing, so
-    // the branch can't move while a tag is rejected.
     pushAttempted = true;
-    run(`git push --atomic origin ${defaultBranch} --tags`);
+    pushRelease(defaultBranch, release);
   } catch (err) {
     console.error(`\n❌ Release failed: ${(err as Error).message || err}`);
 
     // A failed push isn't proof that origin is untouched: the server can
     // accept the update and the connection drop before we hear about it.
     // Only roll back once origin is confirmed to still be where we started.
-    const remoteCommit = pushAttempted ? getRemoteBranchCommit(defaultBranch) : startCommit;
+    const remoteCommit = pushAttempted
+      ? getRemoteBranchCommit(defaultBranch)
+      : startCommit;
     if (remoteCommit === startCommit) {
       if (rollbackLocalRelease(startCommit, tagName)) {
         console.error(
@@ -290,34 +456,30 @@ export async function main(argv: ReadonlyArray<string>): Promise<void> {
       );
       console.error(
         '   Local changes were left as they are. Run `git ls-remote origin` to see what origin ' +
-          `has: if it has v${newVersion}, finish by hand (gh release create, npm publish); ` +
-          'if not, run `git push --atomic origin ' +
-          `${defaultBranch} --tags\` again.`,
+          `has: if it has ${release.tag}, finish by hand (gh release create, npm publish); ` +
+          'if not, push the branch and tag again.',
       );
     }
     throw err;
   }
 
-  // Create GitHub release. From here on, the commit and tag are already
-  // public on origin, so a failure can't be rolled back automatically —
-  // instead each step says exactly what already happened and how to finish
-  // the rest by hand.
+  // Create GitHub release
   const ghNotesFile = path.join(
     os.tmpdir(),
     `release-notes-${crypto.randomBytes(8).toString('hex')}.md`,
   );
-  fs.writeFileSync(ghNotesFile, editedEntry.trim());
+  fs.writeFileSync(ghNotesFile, editedEntry);
   try {
     const releaseUrl = run(
-      `gh release create v${newVersion} --title "v${newVersion}" --notes-file "${ghNotesFile}"`,
+      `gh release create ${shellQuote(release.tag)} --title ${shellQuote(release.title)} --notes-file ${shellQuote(ghNotesFile)}`,
     ).trim();
     console.log(`\n🎉 GitHub release created: ${releaseUrl}`);
   } catch (err) {
     console.error(
-      `\n⚠️  v${newVersion} was committed, tagged, and pushed to ${defaultBranch}, but creating ` +
+      `\n⚠️  ${release.tag} was committed, tagged, and pushed to ${defaultBranch}, but creating ` +
         `the GitHub release failed. This was not rolled back since the tag is already public.\n` +
         `   Release notes were saved to ${ghNotesFile} — retry with:\n` +
-        `     gh release create v${newVersion} --title "v${newVersion}" --notes-file "${ghNotesFile}"`,
+        `     gh release create ${shellQuote(release.tag)} --title ${shellQuote(release.title)} --notes-file ${shellQuote(ghNotesFile)}`,
     );
     throw err;
   }
@@ -325,7 +487,9 @@ export async function main(argv: ReadonlyArray<string>): Promise<void> {
   try {
     fs.unlinkSync(ghNotesFile);
   } catch {
-    console.warn(`⚠️  Could not delete ${ghNotesFile}; you can remove it yourself.`);
+    console.warn(
+      `⚠️  Could not delete ${ghNotesFile}; you can remove it yourself.`,
+    );
   }
 
   if (isPublicPackage) {
@@ -333,7 +497,9 @@ export async function main(argv: ReadonlyArray<string>): Promise<void> {
       console.log(
         `\n⚠️  Warning: package.json has no "private" field. About to publish ${pkg.name} to npm.`,
       );
-      const answer = (await prompt('   Confirm publish? [y/N] ')).trim().toLowerCase();
+      const answer = (await prompt('   Confirm publish? [y/N] '))
+        .trim()
+        .toLowerCase();
       if (answer !== 'y' && answer !== 'yes') {
         console.log(
           'Aborted. Set "private": false in package.json to suppress this prompt.',
@@ -343,11 +509,13 @@ export async function main(argv: ReadonlyArray<string>): Promise<void> {
     }
     const whoami = safeRun('npm whoami');
     if (!whoami.ok) {
-      console.log('\n🔐 Not logged in to npm. Opening browser for npm login...');
+      console.log(
+        '\n🔐 Not logged in to npm. Opening browser for npm login...',
+      );
       const loginResult = safeRun('npm login', { stdio: 'inherit' });
       if (!loginResult.ok) {
         console.error(
-          `\n⚠️  v${newVersion} was released on GitHub, but npm login failed so it was not ` +
+          `\n⚠️  ${release.tag} was released on GitHub, but npm login failed so it was not ` +
             `published to npm.\n   Once you're logged in, publish manually with: npm publish`,
         );
         throw loginResult.err;
@@ -358,18 +526,12 @@ export async function main(argv: ReadonlyArray<string>): Promise<void> {
     const publishCmd = otp ? `npm publish --otp=${otp}` : 'npm publish';
     const publishResult = safeRun(publishCmd, { stdio: 'inherit' });
     if (!publishResult.ok) {
-      // The OTP is a live credential and this lands in terminal scrollback
-      // and CI logs, so the retry hint never spells it out.
-      console.error(
-        `\n⚠️  v${newVersion} was released on GitHub, but \`npm publish\` failed.\n` +
-          `   Retry manually with: npm publish${otp ? ' --otp=<a fresh code>' : ''}`,
-      );
       throw publishResult.err;
     }
     console.log(`\n📦 Published ${pkg.name}@${newVersion} to npm.`);
   }
 
-  console.log(`\nRelease ${newVersion} created and pushed with tags.`);
+  console.log(`\nRelease ${release.tag} created and pushed.`);
 }
 
 export async function cli(argv: ReadonlyArray<string>): Promise<void> {

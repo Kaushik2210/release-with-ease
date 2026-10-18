@@ -1,4 +1,5 @@
 import { run, safeRun } from './exec.ts';
+import { DEFAULT_TAG_PREFIX, type ReleaseName } from './tags.ts';
 
 export interface Commit {
   hash: string;
@@ -31,7 +32,9 @@ export function getDefaultBranch(): string | null {
   }
 
   // Last resort: ask GitHub via gh.
-  const ghRes = safeRun('gh repo view --json defaultBranchRef -q .defaultBranchRef.name');
+  const ghRes = safeRun(
+    'gh repo view --json defaultBranchRef -q .defaultBranchRef.name',
+  );
   if (ghRes.ok) {
     const name = ghRes.out.trim();
     if (name) return name;
@@ -56,7 +59,9 @@ export function preflightChecks(): { defaultBranch: string } {
 
   const currentBranch = getCurrentBranch();
   if (!currentBranch) {
-    throw new Error('HEAD is detached. Check out the default branch before releasing.');
+    throw new Error(
+      'HEAD is detached. Check out the default branch before releasing.',
+    );
   }
   if (currentBranch !== defaultBranch) {
     throw new Error(
@@ -81,10 +86,14 @@ export function preflightChecks(): { defaultBranch: string } {
     const local = localRes.out.trim();
     const remote = remoteRes.out.trim();
     if (local !== remote) {
-      const aheadRes = safeRun(`git rev-list --count origin/${defaultBranch}..HEAD`);
-      const behindRes = safeRun(`git rev-list --count HEAD..origin/${defaultBranch}`);
-      const ahead = aheadRes.ok ? parseInt(aheadRes.out.trim(), 10) : 0;
-      const behind = behindRes.ok ? parseInt(behindRes.out.trim(), 10) : 0;
+      const aheadRes = safeRun(
+        `git rev-list --count origin/${defaultBranch}..HEAD`,
+      );
+      const behindRes = safeRun(
+        `git rev-list --count HEAD..origin/${defaultBranch}`,
+      );
+      const ahead = aheadRes.ok ? Number(aheadRes.out.trim()) : 0;
+      const behind = behindRes.ok ? Number(behindRes.out.trim()) : 0;
       if (behind > 0) {
         throw new Error(
           `Local "${defaultBranch}" is behind origin/${defaultBranch} by ${behind} commit(s). Pull before releasing.`,
@@ -112,9 +121,11 @@ export function getCurrentCommit(): string {
  * asked (or has no such branch), which is different from "unchanged".
  */
 export function getRemoteBranchCommit(branch: string): string | null {
-  const res = safeRun(`git ls-remote origin "refs/heads/${branch}"`);
+  const res = safeRun(
+    `git ls-remote origin ${shellQuote(`refs/heads/${branch}`)}`,
+  );
   if (!res.ok) return null;
-  const sha = res.out.trim().split(/\s+/)[0];
+  const sha = res.out.trim().split(/\s+/, 1)[0];
   return sha || null;
 }
 
@@ -127,15 +138,88 @@ export function getRemoteBranchCommit(branch: string): string | null {
  * attempted; the result is true only if both worked.
  */
 export function rollbackLocalRelease(ref: string, tag: string | null): boolean {
-  const tagDeleted = tag ? safeRun(`git tag -d "${tag}"`).ok : true;
-  const reset = safeRun(`git reset --hard ${ref}`).ok;
+  const tagDeleted = tag ? safeRun(`git tag -d ${shellQuote(tag)}`).ok : true;
+  const reset = safeRun(`git reset --hard ${shellQuote(ref)}`).ok;
   return tagDeleted && reset;
 }
 
-export function getLastVersionTag(): string | null {
-  const res = safeRun('git describe --tags --match "v[0-9]*.[0-9]*.[0-9]*" --abbrev=0');
+export function getLastVersionTag(
+  prefix: string = DEFAULT_TAG_PREFIX,
+): string | null {
+  const pattern = shellQuote(`${prefix}[0-9]*.[0-9]*.[0-9]*`);
+  const res = safeRun(`git describe --tags --match ${pattern} --abbrev=0`);
   if (res.ok) return res.out.trim();
   return null;
+}
+
+export function tagExists(tag: string): boolean {
+  return safeRun(
+    `git rev-parse --quiet --verify ${shellQuote(`refs/tags/${tag}`)}`,
+  ).ok;
+}
+
+export interface LastRelease {
+  tag: string | null;
+  /**
+   * Whether the tag was found under the default `v` prefix rather than the
+   * configured one, which is what happens on the first release after a
+   * package switches to a prefix of its own.
+   */
+  fromDefaultPrefix: boolean;
+}
+
+/**
+ * The tag of the last release, under the configured prefix. A package that
+ * has just moved to a prefix of its own has no tags under it yet, and falling
+ * back to "the last 100 commits" would write its first prefixed release notes
+ * from far too much history — so in that case the `v` tag for the current
+ * version in package.json stands in for the prefixed one. Only that exact tag: a nearer `v`
+ * tag could just as well belong to another package in the same repository.
+ * And only if HEAD descends from it, since a tag on a branch that never
+ * merged would make `<tag>..HEAD` the whole mainline.
+ */
+export function getLastReleaseTag(
+  prefix: string,
+  currentVersion: string | undefined,
+): LastRelease {
+  const tag = getLastVersionTag(prefix);
+  if (tag || prefix === DEFAULT_TAG_PREFIX || !currentVersion) {
+    return { tag, fromDefaultPrefix: false };
+  }
+  const legacy = `${DEFAULT_TAG_PREFIX}${currentVersion}`;
+  if (
+    tagExists(legacy) &&
+    safeRun(`git merge-base --is-ancestor ${shellQuote(legacy)} HEAD`).ok
+  ) {
+    return { tag: legacy, fromDefaultPrefix: true };
+  }
+  return { tag: null, fromDefaultPrefix: false };
+}
+
+/**
+ * Commits the given files — the package's own, relative to the current
+ * directory — and tags that commit. Nothing else is staged: the preflight
+ * checks refused a dirty working tree, so the commit holds exactly what the
+ * release changed.
+ */
+export function commitAndTagRelease(
+  release: ReleaseName,
+  files: ReadonlyArray<string>,
+): void {
+  run(`git add -- ${files.map(shellQuote).join(' ')}`);
+  run(`git commit -m ${shellQuote(release.label)}`);
+  run(`git tag -m ${shellQuote(release.label)} ${shellQuote(release.tag)}`);
+}
+
+/**
+ * Pushes the branch and the one tag this release made. Not `--tags`: in a
+ * repository several packages release from, whatever other tags happen to be
+ * lying around locally have no business going out with this one.
+ */
+export function pushRelease(branch: string, release: ReleaseName): void {
+  run(
+    `git push --atomic origin ${shellQuote(branch)} ${shellQuote(`refs/tags/${release.tag}`)}`,
+  );
 }
 
 /**
@@ -144,7 +228,7 @@ export function getLastVersionTag(): string | null {
  * before git ever saw it — has to be quoted.
  */
 export function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
+  return `'${value.replaceAll("'", String.raw`'\''`)}'`;
 }
 
 /**
@@ -177,7 +261,7 @@ export function getCommitRange(
   // commit — the same one entry per PR the range above produces.
   if (lastTag) {
     const res = safeRun(
-      `git log --first-parent ${lastTag}..HEAD --pretty=format:%H%x1f%s%x1f%b%x1e${pathspec}`,
+      `git log --first-parent ${shellQuote(`${lastTag}..HEAD`)} --pretty=format:%H%x1f%s%x1f%b%x1e${pathspec}`,
     );
     return res.ok ? res.out : '';
   }
@@ -191,11 +275,11 @@ export function getCommitRange(
 export function parseCommits(raw: string): Array<Commit> {
   if (!raw) return [];
   return raw
-    .split('\x1e')
-    .map(chunk => chunk.trim())
+    .split('\u{1E}')
+    .map((chunk) => chunk.trim())
     .filter(Boolean)
-    .map(chunk => {
-      const [hash, subject, body] = chunk.split('\x1f');
+    .map((chunk) => {
+      const [hash, subject, body] = chunk.split('\u{1F}', 3);
       return { hash: hash ?? '', subject: subject || '', body: body || '' };
     });
 }

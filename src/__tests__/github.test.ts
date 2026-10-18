@@ -1,8 +1,11 @@
 import assert from 'node:assert';
-import { afterEach, describe, it } from 'node:test';
 
+import { afterEach, describe, it } from 'vitest';
+
+import { getCommitRange, parseCommits } from '../git.ts';
 import {
   chainByBranchNames,
+  encodeRef,
   extractPrNumber,
   fetchGitHubMeta,
   filterStackByPaths,
@@ -10,9 +13,12 @@ import {
   orderStack,
   type PullRequest,
 } from '../github.ts';
-import { getCommitRange, parseCommits } from '../git.ts';
 import * as fakeGh from '../test-utils/fakeGh.ts';
-import { initRepo, mergeTwoDeepStack, type Repo } from '../test-utils/gitRepo.ts';
+import {
+  initRepo,
+  mergeTwoDeepStack,
+  type Repo,
+} from '../test-utils/gitRepo.ts';
 import * as tmpfs from '../test-utils/tmpfs.ts';
 
 function pr(overrides: Partial<PullRequest> & { number: number }): PullRequest {
@@ -28,7 +34,8 @@ function pr(overrides: Partial<PullRequest> & { number: number }): PullRequest {
   };
 }
 
-const numbers = (prs: ReadonlyArray<{ number: number }>) => prs.map(p => p.number);
+const numbers = (prs: ReadonlyArray<{ number: number }>) =>
+  prs.map((p) => p.number);
 
 describe('extractPrNumber', () => {
   it('reads a squash-merge subject', () => {
@@ -36,11 +43,17 @@ describe('extractPrNumber', () => {
   });
 
   it('reads a merge-commit subject', () => {
-    assert.strictEqual(extractPrNumber('Merge pull request #123 from o/branch', ''), 123);
+    assert.strictEqual(
+      extractPrNumber('Merge pull request #123 from o/branch', ''),
+      123,
+    );
   });
 
   it('falls back to the body', () => {
-    assert.strictEqual(extractPrNumber('Add a thing', 'Add a thing (#123)'), 123);
+    assert.strictEqual(
+      extractPrNumber('Add a thing', 'Add a thing (#123)'),
+      123,
+    );
   });
 
   it('is null when there is no number to find', () => {
@@ -54,7 +67,10 @@ describe('extractPrNumber', () => {
 
 describe('chainByBranchNames', () => {
   it('leaves a single pull request alone', () => {
-    assert.deepStrictEqual(numbers(chainByBranchNames([pr({ number: 7 })]) ?? []), [7]);
+    assert.deepStrictEqual(
+      numbers(chainByBranchNames([pr({ number: 7 })]) ?? []),
+      [7],
+    );
   });
 
   it('orders a chain bottom-first regardless of the order it arrives in', () => {
@@ -63,7 +79,10 @@ describe('chainByBranchNames', () => {
     const middle = pr({ number: 2, baseRefName: 'a', headRefName: 'b' });
     const top = pr({ number: 3, baseRefName: 'b', headRefName: 'c' });
 
-    assert.deepStrictEqual(numbers(chainByBranchNames([top, middle, bottom]) ?? []), [1, 2, 3]);
+    assert.deepStrictEqual(
+      numbers(chainByBranchNames([top, middle, bottom]) ?? []),
+      [1, 2, 3],
+    );
   });
 
   it('does not assume PR number matches stack order', () => {
@@ -71,7 +90,10 @@ describe('chainByBranchNames', () => {
     const bottom = pr({ number: 9, baseRefName: 'main', headRefName: 'a' });
     const top = pr({ number: 4, baseRefName: 'a', headRefName: 'b' });
 
-    assert.deepStrictEqual(numbers(chainByBranchNames([top, bottom]) ?? []), [9, 4]);
+    assert.deepStrictEqual(
+      numbers(chainByBranchNames([top, bottom]) ?? []),
+      [9, 4],
+    );
   });
 
   it('is null when the chain forks', () => {
@@ -103,7 +125,10 @@ describe('against a real merged stack', () => {
     tmpfs.restore();
   });
 
-  function buildStack(): { repo: Repo; stack: ReturnType<typeof mergeTwoDeepStack> } {
+  function buildStack(): {
+    repo: Repo;
+    stack: ReturnType<typeof mergeTwoDeepStack>;
+  } {
     tmpfs.mock({});
     const repo = initRepo();
     repo.git('tag', 'v1.0.0');
@@ -117,7 +142,9 @@ describe('against a real merged stack', () => {
     return { repo, stack };
   }
 
-  function stackPrs(stack: ReturnType<typeof mergeTwoDeepStack>): Array<PullRequest> {
+  function stackPrs(
+    stack: ReturnType<typeof mergeTwoDeepStack>,
+  ): Array<PullRequest> {
     // Newest first, the order `gh pr list` actually returns.
     return [
       pr({
@@ -146,7 +173,10 @@ describe('against a real merged stack', () => {
       const { stack } = buildStack();
       assert.ok(
         isVerifiedChain(
-          [{ headRefOid: stack.bottomHeadSha }, { headRefOid: stack.topHeadSha }],
+          [
+            { headRefOid: stack.bottomHeadSha },
+            { headRefOid: stack.topHeadSha },
+          ],
           stack.mergeSha,
         ),
       );
@@ -156,7 +186,10 @@ describe('against a real merged stack', () => {
       const { stack } = buildStack();
       assert.ok(
         !isVerifiedChain(
-          [{ headRefOid: stack.topHeadSha }, { headRefOid: stack.bottomHeadSha }],
+          [
+            { headRefOid: stack.topHeadSha },
+            { headRefOid: stack.bottomHeadSha },
+          ],
           stack.mergeSha,
         ),
       );
@@ -205,7 +238,10 @@ describe('against a real merged stack', () => {
       // merged. Commits pushed afterwards never landed in this release.
       const { repo, stack } = buildStack();
       repo.git('checkout', stack.topBranch);
-      const movedOn = repo.commit({ 'src/later.js': 'later' }, 'Pushed after merging');
+      const movedOn = repo.commit(
+        { 'src/later.js': 'later' },
+        'Pushed after merging',
+      );
       repo.git('checkout', 'main');
 
       assert.ok(
@@ -230,7 +266,7 @@ describe('against a real merged stack', () => {
       // The names spell out main -> allowlist -> webrtc, but the commit the
       // bottom one points at is not in this merge at all.
       const { stack } = buildStack();
-      const lying = stackPrs(stack).map(p =>
+      const lying = stackPrs(stack).map((p) =>
         p.number === 1 ? { ...p, headRefOid: '0'.repeat(40) } : p,
       );
       const ordered = orderStack(lying, stack.mergeSha);
@@ -241,7 +277,10 @@ describe('against a real merged stack', () => {
 
     it('falls back to PR number, unverified, for unrelated pull requests', () => {
       const { stack } = buildStack();
-      const unrelated = stackPrs(stack).map(p => ({ ...p, baseRefName: 'main' }));
+      const unrelated = stackPrs(stack).map((p) => ({
+        ...p,
+        baseRefName: 'main',
+      }));
       const ordered = orderStack(unrelated, stack.mergeSha);
 
       assert.strictEqual(ordered.verified, false);
@@ -262,7 +301,10 @@ describe('against a real merged stack', () => {
     it('keeps the whole stack when no pathspec is in play', () => {
       const { stack } = buildStack();
       const ordered = orderStack(stackPrs(stack), stack.mergeSha);
-      assert.deepStrictEqual(numbers(filterStackByPaths(ordered, stack.mergeSha, [])), [1, 2]);
+      assert.deepStrictEqual(
+        numbers(filterStackByPaths(ordered, stack.mergeSha, [])),
+        [1, 2],
+      );
     });
 
     it('keeps only the pull request that touched the path', () => {
@@ -270,7 +312,9 @@ describe('against a real merged stack', () => {
       const ordered = orderStack(stackPrs(stack), stack.mergeSha);
 
       assert.deepStrictEqual(
-        numbers(filterStackByPaths(ordered, stack.mergeSha, ['src/allowlist.js'])),
+        numbers(
+          filterStackByPaths(ordered, stack.mergeSha, ['src/allowlist.js']),
+        ),
         [1],
       );
       assert.deepStrictEqual(
@@ -292,17 +336,22 @@ describe('against a real merged stack', () => {
       const { stack } = buildStack();
       // The prs are in the right order, but nothing verified that, so the
       // ranges between them are not something to trust.
-      const unverified = { prs: orderStack(stackPrs(stack), stack.mergeSha).prs, verified: false };
+      const unverified = {
+        prs: orderStack(stackPrs(stack), stack.mergeSha).prs,
+        verified: false,
+      };
 
       assert.deepStrictEqual(
-        numbers(filterStackByPaths(unverified, stack.mergeSha, ['src/webrtc.js'])),
+        numbers(
+          filterStackByPaths(unverified, stack.mergeSha, ['src/webrtc.js']),
+        ),
         [1, 2],
       );
     });
 
     it('leaves a stack whole when a head commit cannot be placed', () => {
       const { stack } = buildStack();
-      const lying = stackPrs(stack).map(p =>
+      const lying = stackPrs(stack).map((p) =>
         p.number === 1 ? { ...p, headRefOid: '0'.repeat(40) } : p,
       );
 
@@ -334,12 +383,26 @@ describe('against a real merged stack', () => {
       const mergeSha = repo.sha('HEAD');
 
       const siblings = [
-        pr({ number: 1, headRefName: 'one', headRefOid: oneHead, mergeCommit: { oid: mergeSha } }),
-        pr({ number: 2, headRefName: 'two', headRefOid: twoHead, mergeCommit: { oid: mergeSha } }),
+        pr({
+          number: 1,
+          headRefName: 'one',
+          headRefOid: oneHead,
+          mergeCommit: { oid: mergeSha },
+        }),
+        pr({
+          number: 2,
+          headRefName: 'two',
+          headRefOid: twoHead,
+          mergeCommit: { oid: mergeSha },
+        }),
       ];
 
       assert.deepStrictEqual(
-        numbers(filterStackByPaths(orderStack(siblings, mergeSha), mergeSha, ['src/two.js'])),
+        numbers(
+          filterStackByPaths(orderStack(siblings, mergeSha), mergeSha, [
+            'src/two.js',
+          ]),
+        ),
         [1, 2],
       );
     });
@@ -358,15 +421,21 @@ describe('against a real merged stack', () => {
       const result = analyze();
 
       assert.deepStrictEqual(
-        result.map(c => c.prNumber),
+        result.map((c) => c.prNumber),
         [1, 2],
       );
-      assert.deepStrictEqual(result.map(c => c.subject), [
-        'Let targets restrict which hostnames the browser may reach',
-        'Stop WebRTC talking to the network',
-      ]);
+      assert.deepStrictEqual(
+        result.map((c) => c.subject),
+        [
+          'Let targets restrict which hostnames the browser may reach',
+          'Stop WebRTC talking to the network',
+        ],
+      );
       // Both entries come from the one mainline commit the stack landed as.
-      assert.deepStrictEqual(new Set(result.map(c => c.hash)), new Set([stack.mergeSha]));
+      assert.deepStrictEqual(
+        new Set(result.map((c) => c.hash)),
+        new Set([stack.mergeSha]),
+      );
     });
 
     it('attributes each entry to its own pull request author', () => {
@@ -376,7 +445,7 @@ describe('against a real merged stack', () => {
       fakeGh.install({ nameWithOwner: 'happo/test', prList: prs });
 
       assert.deepStrictEqual(
-        analyze().map(c => c.githubLogin),
+        analyze().map((c) => c.githubLogin),
         ['trotzig', 'lencioni'],
       );
     });
@@ -386,15 +455,15 @@ describe('against a real merged stack', () => {
       fakeGh.install({ nameWithOwner: 'happo/test', prList: stackPrs(stack) });
 
       assert.deepStrictEqual(
-        analyze(['src/allowlist.js']).map(c => c.prNumber),
+        analyze(['src/allowlist.js']).map((c) => c.prNumber),
         [1],
       );
       assert.deepStrictEqual(
-        analyze(['src/webrtc.js']).map(c => c.prNumber),
+        analyze(['src/webrtc.js']).map((c) => c.prNumber),
         [2],
       );
       assert.deepStrictEqual(
-        analyze(['src/shared.js']).map(c => c.prNumber),
+        analyze(['src/shared.js']).map((c) => c.prNumber),
         [1, 2],
       );
     });
@@ -406,7 +475,13 @@ describe('against a real merged stack', () => {
       repo.git('checkout', '-b', 'solo', 'main');
       const head = repo.commit({ 'solo.js': 's' }, 'Solo work');
       repo.git('checkout', 'main');
-      repo.git('merge', '--no-ff', 'solo', '-m', 'Merge pull request #5 from o/solo');
+      repo.git(
+        'merge',
+        '--no-ff',
+        'solo',
+        '-m',
+        'Merge pull request #5 from o/solo',
+      );
       const mergeSha = repo.sha('HEAD');
 
       fakeGh.install({
@@ -468,9 +543,24 @@ describe('against a real merged stack', () => {
       const repo = initRepo();
       repo.git('tag', 'v1.0.0');
       const sha = repo.commit({ 'a.js': 'a' }, 'Pushed straight to main');
-      fakeGh.install({ nameWithOwner: 'happo/test', compare: [[sha, 'lencioni']] });
+      fakeGh.install({
+        nameWithOwner: 'happo/test',
+        compare: [[sha, 'lencioni']],
+      });
 
       assert.strictEqual(analyze()[0]?.githubLogin, 'lencioni');
     });
+  });
+});
+
+describe('encodeRef', () => {
+  it('leaves an ordinary tag alone', () => {
+    assert.strictEqual(encodeRef('v1.2.3'), 'v1.2.3');
+  });
+
+  it('keeps the slashes of a scoped tag but encodes what a URL would misread', () => {
+    assert.strictEqual(encodeRef('@happo/cli@1.0.0'), '%40happo/cli%401.0.0');
+    assert.strictEqual(encodeRef('server#1.0.0'), 'server%231.0.0');
+    assert.strictEqual(encodeRef('a%b@1.0.0'), 'a%25b%401.0.0');
   });
 });

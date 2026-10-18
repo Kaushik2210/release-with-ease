@@ -1,5 +1,5 @@
 import { safeRun } from './exec.ts';
-import { pathspecSuffix, type Commit } from './git.ts';
+import { type Commit, pathspecSuffix, shellQuote } from './git.ts';
 
 export interface PullRequest {
   number: number;
@@ -17,16 +17,25 @@ export interface CommitWithMeta extends Commit {
   prNumber: number | null;
 }
 
+/**
+ * A ref as it goes into an API path. Ref names may hold `#`, `%` and other
+ * characters a URL gives a meaning to, so each part is percent-encoded; the
+ * slashes between parts stay, as GitHub reads them in a ref.
+ */
+export function encodeRef(ref: string): string {
+  return ref.split('/').map(encodeURIComponent).join('/');
+}
+
 export function extractPrNumber(subject: string, body: string): number | null {
   // "(#123)" suffix — squash-merge style
   const m = subject.match(/\(#(\d+)\)\s*$/);
-  if (m?.[1]) return parseInt(m[1], 10);
+  if (m?.[1]) return Number(m[1]);
   // "Merge pull request #123" — merge commit style
   const mm = subject.match(/Merge pull request #(\d+)/);
-  if (mm?.[1]) return parseInt(mm[1], 10);
+  if (mm?.[1]) return Number(mm[1]);
   // Same patterns in body
   const bm = (body || '').match(/\(#(\d+)\)\s*$/m);
-  if (bm?.[1]) return parseInt(bm[1], 10);
+  if (bm?.[1]) return Number(bm[1]);
   return null;
 }
 
@@ -50,8 +59,8 @@ export interface OrderedStack<T> {
 export function chainByBranchNames<
   T extends Pick<PullRequest, 'baseRefName' | 'headRefName'>,
 >(prs: ReadonlyArray<T>): Array<T> | null {
-  const heads = new Set(prs.map(pr => pr.headRefName));
-  const bottom = prs.filter(pr => !heads.has(pr.baseRefName));
+  const heads = new Set(prs.map((pr) => pr.headRefName));
+  const bottom = prs.filter((pr) => !heads.has(pr.baseRefName));
   if (bottom.length !== 1 || bottom[0] === undefined) return null;
 
   const ordered: Array<T> = [];
@@ -59,7 +68,7 @@ export function chainByBranchNames<
   while (current && !ordered.includes(current)) {
     ordered.push(current);
     const head: string = current.headRefName;
-    current = prs.find(pr => pr.baseRefName === head);
+    current = prs.find((pr) => pr.baseRefName === head);
   }
   return ordered.length === prs.length ? ordered : null;
 }
@@ -84,7 +93,7 @@ export function isVerifiedChain(
   orderedPrs: ReadonlyArray<Pick<PullRequest, 'headRefOid'>>,
   mergeSha: string,
 ): boolean {
-  if (orderedPrs.some(pr => !pr.headRefOid)) return false;
+  if (orderedPrs.some((pr) => !pr.headRefOid)) return false;
 
   // `--is-ancestor` exits non-zero both when it isn't an ancestor and when
   // the objects aren't here to compare — neither is something we can measure.
@@ -113,12 +122,15 @@ export function isVerifiedChain(
  * same claim, so both wait on the same check.
  */
 export function orderStack<
-  T extends Pick<PullRequest, 'number' | 'baseRefName' | 'headRefName' | 'headRefOid'>,
+  T extends Pick<
+    PullRequest,
+    'number' | 'baseRefName' | 'headRefName' | 'headRefOid'
+  >,
 >(prs: ReadonlyArray<T>, mergeSha: string): OrderedStack<T> {
   if (prs.length < 2) return { prs: [...prs], verified: false };
 
   const byNumber = (): OrderedStack<T> => ({
-    prs: [...prs].sort((a, b) => a.number - b.number),
+    prs: prs.toSorted((a, b) => a.number - b.number),
     verified: false,
   });
 
@@ -160,7 +172,8 @@ export function filterStackByPaths<T extends Pick<PullRequest, 'headRefOid'>>(
   paths: ReadonlyArray<string>,
 ): Array<T> {
   const orderedPrs = stack.prs;
-  if (!paths.length || orderedPrs.length < 2 || !stack.verified) return [...orderedPrs];
+  if (!paths.length || orderedPrs.length < 2 || !stack.verified)
+    return [...orderedPrs];
 
   const firstParent = safeRun(`git rev-parse ${mergeSha}^1`);
   if (!firstParent.ok) return [...orderedPrs];
@@ -183,25 +196,27 @@ export function fetchGitHubMeta(
 ): Array<CommitWithMeta> {
   // Without gh there is no repository to ask about, but the commit messages
   // are still here and still say which pull request they came from.
-  const repoRes = safeRun('gh repo view --json nameWithOwner -q .nameWithOwner');
+  const repoRes = safeRun(
+    'gh repo view --json nameWithOwner -q .nameWithOwner',
+  );
   if (!repoRes.ok) {
-    return commits.map(c => ({
+    return commits.map((c) => ({
       ...c,
       githubLogin: null,
       prNumber: extractPrNumber(c.subject, c.body),
     }));
   }
-  const [owner, repo] = repoRes.out.trim().split('/');
+  const [owner, repo] = repoRes.out.trim().split('/', 2);
 
   // SHA → GitHub login via compare API (best-effort)
   const shaToLogin: Record<string, string> = {};
   if (lastTag) {
     const cmpRes = safeRun(
-      `gh api "repos/${owner}/${repo}/compare/${lastTag}...HEAD" --jq '.commits[] | [.sha, (.author.login // "")] | @tsv'`,
+      `gh api ${shellQuote(`repos/${owner}/${repo}/compare/${encodeRef(lastTag)}...HEAD`)} --jq '.commits[] | [.sha, (.author.login // "")] | @tsv'`,
     );
     if (cmpRes.ok) {
       for (const line of cmpRes.out.trim().split('\n').filter(Boolean)) {
-        const [sha, login] = line.split('\t');
+        const [sha, login] = line.split('\t', 2);
         if (sha && login) shaToLogin[sha] = login;
       }
     }
@@ -254,7 +269,7 @@ export function fetchGitHubMeta(
     // top of it get described instead of disappearing into their neighbour's
     // merge commit.
     const stack = filterStackByPaths(orderStack(prs, c.hash), c.hash, paths);
-    return stack.map(pr => ({
+    return stack.map((pr) => ({
       ...c,
       subject: pr.title || c.subject,
       body: pr.body || c.body,
